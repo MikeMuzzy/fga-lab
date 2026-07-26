@@ -29,14 +29,28 @@ type Permission struct {
 // On binds the permission to a concrete object id, producing a Check.
 func (p Permission) On(id string) Check { return Check{perm: p, id: id} }
 
-// Check is a fully bound authorization question: (permission, object id).
+// Context carries check-time parameters for the FGA model's ABAC conditions,
+// e.g. the concrete path a path_matches condition should test.
+type Context map[string]any
+
+// Check is a fully bound authorization question: (permission, object id),
+// optionally parameterized with condition context.
 type Check struct {
 	perm Permission
 	id   string
+	ctx  Context
+}
+
+// WithContext attaches condition context to the check and returns it. It
+// does not mutate the receiver.
+func (c Check) WithContext(ctx Context) Check {
+	c.ctx = ctx
+	return c
 }
 
 func (c Check) Object() string   { return c.perm.objType + ":" + c.id }
 func (c Check) Relation() string { return c.perm.relation }
+func (c Check) Context() Context { return c.ctx }
 
 // Decision is an answer, not an error. Deny is a normal value; error is
 // reserved for infrastructure failure, which callers must treat as deny.
