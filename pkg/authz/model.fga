@@ -1,0 +1,26 @@
+model
+  schema 1.1
+
+type user
+
+type group
+  relations
+    define member: [user]
+
+type path_grant
+  relations
+    define holder: [user, group#member]
+
+type filesystem
+  relations
+    define recursive_list_grant: [path_grant with path_matches]
+
+    define can_recursive_list:
+      holder from recursive_list_grant
+
+condition path_matches(
+  requested_path: string,
+  allowed_pattern: string
+) {
+  requested_path.matches(allowed_pattern)
+}
