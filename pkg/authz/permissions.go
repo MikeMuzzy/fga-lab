@@ -1,11 +1,5 @@
 package authz
 
-// CanRecursiveList authorizes recursively listing (and, for the mount
-// proxy, bind-mounting) a path under a filesystem object. The check must be
-// bound with a Context carrying "requested_path" for the model's
-// path_matches condition to evaluate.
-//var CanRecursiveList = Permission{objType: "filesystem", relation: "can_recursive_list"}
-
 // The catalog mirrors podman-authz.fga 1:1. ValidateModel refuses to boot if
 // any pair here is absent from the deployed model, turning drift into a
 // failed deploy instead of a runtime 403 mystery.
@@ -21,6 +15,9 @@ var (
 	ContainerUpdate  = Permission{"container", "can_update"}
 	ContainerDelete  = Permission{"container", "can_delete"}
 
+	// CanMount authorizes bind-mounting a host path. Bind with Context{
+	// "requested_path": <source>} so the model's path_matches condition has
+	// something to evaluate.
 	CanMount = Permission{"filesystem", "can_mount"}
 
 	PodView    = Permission{"pod", "can_view"}
@@ -46,6 +43,7 @@ var (
 var all = []Permission{
 	HostCreate, HostViewInfo, HostViewEvents, HostPrune,
 	ContainerView, ContainerOperate, ContainerExec, ContainerUpdate, ContainerDelete,
+	CanMount,
 	PodView, PodOperate, PodDelete,
 	ImageUse, ImagePush, ImageDelete,
 	VolumeMount, VolumeDelete,

@@ -68,26 +68,23 @@ var routes = []route{
 }
 
 // containerCreateChecks is the composite check: host create right, can_use on
-// the image, and a grant on every named volume and network in the spec.
+// the image, a grant on every named volume and network in the spec, and a
+// filesystem.can_mount grant covering every bind mount's source path (the
+// model's path_matches condition, not a blanket bind-mount ban, is what
+// closes the "mount / and exec in" escalation path).
 func containerCreateChecks(r *http.Request) ([]authz.Check, error) {
 	var spec struct {
 		Image   string `json:"image"`
 		Volumes []struct {
-			Name string `json:"Name"`
+			Name string `json:"name"`
 		} `json:"volumes"`
-		Networks map[string]json.RawMessage `json:"Networks"`
+		Networks map[string]json.RawMessage `json:"networks"`
 		Mounts   []struct {
 			Source string `json:"source"`
 		} `json:"mounts"`
 	}
 	if err := decodeAndRestore(r, &spec); err != nil {
 		return nil, err
-	}
-
-	// Bind mounts are proxy-side policy, not tuples: this is what closes the
-	// "mount / and exec in" escalation path.
-	if len(spec.Mounts) > 0 {
-		return nil, fmt.Errorf("bind mounts are not permitted")
 	}
 
 	// Production note: resolve the image reference to its digest/id first so
@@ -110,12 +107,21 @@ func containerCreateChecks(r *http.Request) ([]authz.Check, error) {
 	return checks, nil
 }
 
+// maxContainerSpecBytes bounds how much of the request body decodeAndRestore
+// will buffer in memory to inspect before forwarding it.
+const maxContainerSpecBytes = 1 << 20 // 1MiB
+
 // decodeAndRestore reads the body for inspection and puts it back so the
-// reverse proxy can forward it unchanged.
+// reverse proxy can forward it unchanged. It rejects oversized bodies
+// outright rather than silently truncating them, which would otherwise
+// decode (and forward) a corrupted spec without error.
 func decodeAndRestore(r *http.Request, v any) error {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxContainerSpecBytes+1))
 	if err != nil {
 		return fmt.Errorf("read body: %w", err)
+	}
+	if len(body) > maxContainerSpecBytes {
+		return fmt.Errorf("request body exceeds %d bytes", maxContainerSpecBytes)
 	}
 	r.Body.Close()
 	r.Body = io.NopCloser(bytes.NewReader(body))

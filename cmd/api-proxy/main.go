@@ -2,14 +2,14 @@ package main
 
 import (
 	"context"
-	"fga-lib/pkg/authn"
-	"fga-lib/pkg/proxyhttp"
 	"log"
 	"net"
 	"net/http"
 	"os"
 
+	"fga-lib/pkg/authn"
 	"fga-lib/pkg/authz"
+	"fga-lib/pkg/proxyhttp"
 )
 
 // connContext runs once per accepted connection. Peer credentials are a
@@ -45,11 +45,6 @@ func main() {
 	if addr == "" {
 		addr = ":8080"
 	}
-
-	//h := &proxyhttp.Handler{
-	//	Authn: authn.Stub{},
-	//	Authz: fga,
-	//}
 
 	srv := &http.Server{
 		Addr: addr,

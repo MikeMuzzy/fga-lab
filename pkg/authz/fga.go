@@ -64,6 +64,10 @@ func (f *FGA) loadModel(ctx context.Context, r io.Reader) (string, error) {
 		return "", err
 	}
 
+	if err := ValidateModel(proto.TypeDefinitions); err != nil {
+		return "", err
+	}
+
 	resp, err := f.srv.WriteAuthorizationModel(ctx, &openfgav1.WriteAuthorizationModelRequest{
 		StoreId:         f.storeId,
 		TypeDefinitions: proto.TypeDefinitions,
@@ -143,9 +147,11 @@ func (f *FGA) BatchCheck(ctx context.Context, sub Subject, cs []Check) (Decision
 
 func (f *FGA) ListIDs(ctx context.Context, sub Subject, p Permission) (map[string]bool, error) {
 	resp, err := f.srv.ListObjects(ctx, &openfgav1.ListObjectsRequest{
-		User:     sub.String(),
-		Relation: p.relation,
-		Type:     p.objType,
+		StoreId:              f.storeId,
+		AuthorizationModelId: f.modelId,
+		User:                 sub.String(),
+		Relation:             p.relation,
+		Type:                 p.objType,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fga list objects: %w", err)
@@ -163,7 +169,7 @@ func (f *FGA) ListIDs(ctx context.Context, sub Subject, p Permission) (map[strin
 
 // Grant seeds a relationship tuple in the store, e.g. attaching a user to a
 // path_grant's holder relation, or attaching a path_grant to a filesystem's
-// recursive_list_grant relation with a path_matches condition. It is used to
+// mount_grant relation with a path_matches condition. It is used to
 // bootstrap policy data and in tests, not to answer authorization questions,
 // so it lives on FGA rather than the Authorizer interface.
 type Grant struct {
@@ -201,6 +207,34 @@ func (f *FGA) WriteGrants(ctx context.Context, grants ...Grant) error {
 	})
 	if err != nil {
 		return fmt.Errorf("fga write grants: %w", err)
+	}
+
+	return nil
+}
+
+// ValidateModel checks that every permission in the catalog (permissions.go)
+// names a (type, relation) pair the deployed model actually defines. It is
+// called while loading the model so that permissions.go/model.fga drift
+// fails the boot with a precise error instead of surfacing later as a
+// runtime "unknown relation" error on whichever request hits it first.
+func ValidateModel(defs []*openfgav1.TypeDefinition) error {
+	relations := make(map[string]map[string]bool, len(defs))
+	for _, td := range defs {
+		rs := make(map[string]bool, len(td.GetRelations()))
+		for rel := range td.GetRelations() {
+			rs[rel] = true
+		}
+		relations[td.GetType()] = rs
+	}
+
+	var missing []string
+	for _, p := range all {
+		if !relations[p.objType][p.relation] {
+			missing = append(missing, p.objType+"#"+p.relation)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("authz: model missing permissions declared in catalog: %s", strings.Join(missing, ", "))
 	}
 
 	return nil

@@ -13,8 +13,52 @@ type path_grant
 
 type filesystem
   relations
-    define recursive_list_grant: [path_grant with path_matches]
-    define can_recursive_list: holder from recursive_list_grant
+    define mount_grant: [path_grant with path_matches]
+    define can_mount: holder from mount_grant
+
+type host
+  relations
+    define can_create: [user, group#member]
+    define can_view_info: [user, group#member]
+    define can_view_events: [user, group#member]
+    define can_prune: [user, group#member]
+
+type image
+  relations
+    define can_use: [user, group#member]
+    define can_push: [user, group#member]
+    define can_delete: [user, group#member]
+
+type container
+  relations
+    define owner: [user]
+    define can_view: [user, group#member] or owner
+    define can_operate: [user, group#member] or owner
+    define can_exec: [user, group#member] or owner
+    define can_update: [user, group#member] or owner
+    define can_delete: [user, group#member] or owner
+
+type pod
+  relations
+    define owner: [user]
+    define can_view: [user, group#member] or owner
+    define can_operate: [user, group#member] or owner
+    define can_delete: [user, group#member] or owner
+
+type volume
+  relations
+    define can_mount: [user, group#member]
+    define can_delete: [user, group#member]
+
+type network
+  relations
+    define can_connect: [user, group#member]
+    define can_delete: [user, group#member]
+
+type secret
+  relations
+    define can_use: [user, group#member]
+    define can_delete: [user, group#member]
 
 condition path_matches(requested_path: string, allowed_pattern: string) {
   requested_path.matches(allowed_pattern)

@@ -42,13 +42,18 @@ func (Stub) Authenticate(r *http.Request) (authz.Subject, error) {
 	return authz.Subject{UID: uint32(uid)}, nil
 }
 
+// subjectKey is unexported so only this package can set the Subject that
+// SubjectFrom reads back; a request handler cannot forge one.
 type subjectKey struct{}
 
+// WithSubject attaches sub to ctx, e.g. from http.Server.ConnContext once
+// SO_PEERCRED is verified for the connection.
 func WithSubject(ctx context.Context, sub authz.Subject) context.Context {
-	return context.WithValue(ctx, "subject", sub)
+	return context.WithValue(ctx, subjectKey{}, sub)
 }
 
+// SubjectFrom reads back the Subject WithSubject attached, if any.
 func SubjectFrom(ctx context.Context) (authz.Subject, bool) {
-	sub, ok := ctx.Value("subject").(authz.Subject)
+	sub, ok := ctx.Value(subjectKey{}).(authz.Subject)
 	return sub, ok
 }
