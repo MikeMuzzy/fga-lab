@@ -76,7 +76,9 @@ func containerCreateChecks(r *http.Request) ([]authz.Check, error) {
 			Name string `json:"Name"`
 		} `json:"volumes"`
 		Networks map[string]json.RawMessage `json:"Networks"`
-		Mounts   []json.RawMessage          `json:"mounts"`
+		Mounts   []struct {
+			Source string `json:"source"`
+		} `json:"mounts"`
 	}
 	if err := decodeAndRestore(r, &spec); err != nil {
 		return nil, err
@@ -99,6 +101,11 @@ func containerCreateChecks(r *http.Request) ([]authz.Check, error) {
 	}
 	for name := range spec.Networks {
 		checks = append(checks, authz.NetworkConnect.On(name))
+	}
+	for _, m := range spec.Mounts {
+		checks = append(checks, authz.CanMount.
+			On("host").
+			WithContext(authz.Context{"requested_path": m.Source}))
 	}
 	return checks, nil
 }
