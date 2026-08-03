@@ -7,19 +7,36 @@ type group
   relations
     define member: [user]
 
-type folder
+# Container images. Pull is gated on the registry the reference names.
+type image
   relations
+    define puller: [user, group#member] with registry_allowed
     define owner: [user]
-    define editor: [user, group#member] with path_match
-    define viewer: [user, user:*, group#member]
-    define can_write: owner or editor
-    define can_read: viewer or can_write
+    define can_pull: puller or owner
+    define can_remove: owner
 
-# The pattern is fixed when the grant is written and is authoritative: OpenFGA
+# Host paths offered as bind mounts. The grant fixes the subtree; the request
+# names the concrete path, so a caller cannot widen its own grant.
+type bind
+  relations
+    define parent: [bind]
+    define mounter: [user, group#member] with path_within
+    define owner: [user]
+    define can_mount: mounter or owner or can_mount from parent
+    define can_manage: owner
+
+# The subtree is fixed when the grant is written and is authoritative: OpenFGA
 # gives tuple context precedence over Check context, so a caller cannot widen it.
-# fga:write allowed_pattern
-# The path comes from the request being authorized.
-# fga:check requested_path
-condition path_match(allowed_pattern: string, requested_path: string) {
-  requested_path.startsWith(allowed_pattern)
+# fga:write allowed_prefix
+# The path comes from the request being authorized. Clean and resolve it before
+# constructing the request; CEL does a string prefix test and nothing more.
+# fga:check src_path
+condition path_within(allowed_prefix: string, src_path: string) {
+  src_path.startsWith(allowed_prefix)
+}
+
+# fga:write allowed_registries
+# fga:check image_registry
+condition registry_allowed(allowed_registries: list<string>, image_registry: string) {
+  image_registry in allowed_registries
 }
