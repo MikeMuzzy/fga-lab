@@ -8,11 +8,23 @@ import (
 {{- end }}
 )
 {{ end }}
+// ---- object identifiers ----
+//
+// One distinct type per object type in the model, so ids of different types
+// cannot be transposed at a call site. They are string underneath; the type
+// exists only to make the mistake fail to compile.
+{{ range .ObjectTypes }}
+// {{ .IDType }} identifies a {{ .Name }}.
+type {{ .IDType }} string
+
+// Ref renders the OpenFGA object reference, e.g. {{ printf "%q" (printf "%s:abc" .Name) }}.
+func (id {{ .IDType }}) Ref() string { return {{ printf "%q" (printf "%s:" .Name) }} + string(id) }
+{{ end }}
 // ---- permissions: checkable relations ----
 
 var (
 {{- range .Permissions }}
-	{{ .GoName }} = Permission{ {{ printf "%q" .Type }}, {{ printf "%q" .Relation }} }
+	{{ .GoName }} = Permission{objType: {{ printf "%q" .Type }}, relation: {{ printf "%q" .Relation }} }
 {{- end }}
 )
 
@@ -26,11 +38,49 @@ func Permissions() []Permission {
 	}
 }
 
+// ---- check builders ----
+//
+// One per permission. Evaluating a permission may traverse conditioned edges
+// anywhere in its rewrite closure, so every condition it can reach that has
+// check-time parameters appears as a required argument. The set is an
+// over-approximation: a Check that happens to match an unconditioned tuple
+// simply leaves the extra context unread.
+{{ range .Permissions }}
+{{- if .ArgStruct }}
+// {{ .ArgStruct }} carries the check-time context for {{ .Builder }}.
+type {{ .ArgStruct }} struct {
+{{- range .Args }}
+	// {{ .FieldName }} supplies condition {{ printf "%q" .Condition }}.
+	{{ .FieldName }} {{ .TypeName }}
+{{- end }}
+}
+{{ end }}
+// {{ .Builder }} builds a Check for {{ printf "%q" .Relation }} on {{ printf "%q" .Type }}.
+{{- range .Args }}
+// Reaches condition {{ printf "%q" .Condition }}.
+{{- end }}
+func {{ .Builder }}(object {{ .IDType }}
+	{{- if .ArgStruct }}, cc {{ .ArgStruct }}
+	{{- else }}{{ range .Args }}, {{ .ParamName }} {{ .TypeName }}{{ end }}{{ end }}) Check {
+{{- if not .Args }}
+	return {{ .GoName }}.On(string(object))
+{{- else if and (eq (len .Args) 1) (not .ArgStruct) }}
+	return {{ .GoName }}.On(string(object)).WithContext({{ (index .Args 0).ParamName }}.CheckContext())
+{{- else }}
+	ctx := make(map[string]any)
+{{- $s := .ArgStruct }}
+{{- range .Args }}
+	maps.Copy(ctx, {{ if $s }}cc.{{ .FieldName }}{{ else }}{{ .ParamName }}{{ end }}.CheckContext())
+{{- end }}
+	return {{ .GoName }}.On(string(object)).WithContext(ctx)
+{{- end }}
+}
+{{ end }}
 // ---- roles: assignable relations, the only ones a grant may reference ----
 
 var (
 {{- range .Roles }}
-	Role{{ .GoName }} = Role{ {{ printf "%q" .Type }}, {{ printf "%q" .Relation }} }
+	Role{{ .GoName }} = Role{objType: {{ printf "%q" .Type }}, relation: {{ printf "%q" .Relation }} }
 {{- end }}
 )
 
@@ -51,25 +101,12 @@ func Conditions() []ConditionSpec {
 	return []ConditionSpec{
 {{- range .Conditions }}
 		{
-			Name: {{ printf "%q" .Name }},
+			Name:        {{ printf "%q" .Name }},
 			WriteParams: []string{ {{- range .Write }}{{ printf "%q" .Name }}, {{ end -}} },
 			CheckParams: []string{ {{- range .Check }}{{ printf "%q" .Name }}, {{ end -}} },
 		},
 {{- end }}
 	}
-}
-
-// Tuple is a relationship tuple ready to be written. The adapter converts it to
-// the SDK request type; keeping the SDK out of this package means a client
-// upgrade does not require regenerating.
-type Tuple struct {
-	User     string
-	Relation string
-	Object   string
-
-	// Condition and Context are empty for unconditioned grants.
-	Condition string
-	Context   map[string]any
 }
 {{ range .Conditions }}
 // ---- condition {{ .Name }} ----
@@ -127,16 +164,20 @@ func (r {{ .GoName }}Request) CheckContext() map[string]any {
 {{- if .Condition }}
 // The model requires condition {{ printf "%q" .Condition }} on this edge.
 {{- end }}
-func {{ .GoName }}({{ if .NeedsSubject }}subjectID, {{ end }}objectID string{{ if .Condition }}, grant {{ .ConditionGoName }}Grant{{ end }}) Tuple {
-	return Tuple{
-		User:     {{ .UserExpr }},
-		Relation: {{ printf "%q" .Relation }},
-		Object:   {{ printf "%q" (printf "%s:" .Type) }} + objectID,
+func {{ .GoName }}({{ if .SubjectIDType }}subjectID {{ .SubjectIDType }}, {{ end }}objectID {{ .ObjectIDType }}
+	{{- if .Condition }}, grant {{ .ConditionGoName }}Grant{{ end }}) Tuple {
+	return newTuple(
+		{{ .UserExpr }},
+		{{ printf "%q" .Relation }},
+		objectID.Ref(),
 {{- if .Condition }}
-		Condition: {{ printf "%q" .Condition }},
-		Context:   grant.WriteContext(),
+		{{ printf "%q" .Condition }},
+		grant.WriteContext(),
+{{- else }}
+		"",
+		nil,
 {{- end }}
-	}
+	)
 }
 {{ end }}
 {{- if .NeedsSliceHelper }}
