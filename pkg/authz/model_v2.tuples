@@ -1,0 +1,25 @@
+# who may use podman at all (the image check is orthogonal to this)
+group:sre-prod#member          operator        environment:prod
+host:hv-lon-01                 environment     environment:prod
+
+# the policy definition — ONE tuple, diffable, four-eyes reviewable
+user:*   pattern   image_policy:java-base-v7
+  image_allowed{
+    allowed_patterns: [
+      "^registry.corp.example/base/ubi9(-minimal)?$",
+      "^registry.corp.example/java/(temurin|corretto)-(17|21)$"
+    ],
+    require_digest: true
+  }
+
+# entitlement, time-boxed
+group:payments-devs#member  subject  image_policy:java-base-v7
+  active_grant{not_before: "2026-08-01T00:00:00Z", not_after: "2026-11-01T00:00:00Z"}
+
+# binding policy to scope
+image_policy:java-base-v7   image_policy   environment:prod
+
+# global quarantine (CVE recall, floating tags)
+user:*  denies  deny_policy:quarantine
+  image_denied{denied_patterns: ["^.*:latest$", "^registry.corp.example/legacy/log4j-app:.*$"]}
+deny_policy:quarantine  deny_policy  environment:prod
