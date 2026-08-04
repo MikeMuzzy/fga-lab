@@ -1,0 +1,56 @@
+model
+  schema 1.2
+
+type user
+
+type group
+  relations
+    define member: [user, group#member]
+
+type environment          # prod / uat / dev — the blast-radius boundary
+  relations
+    define parent: [environment]
+    define operator: [user, group#member] or operator from parent
+    define image_policy: [image_policy] or image_policy from parent
+    define deny_policy: [deny_policy] or deny_policy from parent
+
+type host
+  relations
+    define environment: [environment]
+    define operator: [user, group#member] or operator from environment
+    define image_policy: [image_policy] or image_policy from environment
+    define deny_policy: [deny_policy] or deny_policy from environment
+    define permitted_image: permits from image_policy
+    define denied_image: denies from deny_policy
+    define can_create_container: (operator and permitted_image) but not denied_image
+
+type image_policy         # a named, versioned, reviewable bundle of patterns
+  relations
+    define owner: [group#member]
+    define subject: [user, group#member, user with active_grant, group#member with active_grant]
+    define pattern: [user:* with image_allowed]
+    define permits: subject and pattern
+
+type deny_policy
+  relations
+    define owner: [group#member]
+    define denies: [user:* with image_denied, user with image_denied, group#member with image_denied]
+
+condition image_allowed(
+    image_repo: string,        # canonical "registry/namespace/name", from context
+    image_tag: string,
+    image_digest: string,
+    allowed_patterns: list<string>,   # from the tuple
+    require_digest: bool
+) {
+    (require_digest == false || image_digest != "") &&
+    allowed_patterns.exists(p, image_repo.matches(p))
+}
+
+condition image_denied(image_repo: string, image_tag: string, denied_patterns: list<string>) {
+    denied_patterns.exists(p, (image_repo + ":" + image_tag).matches(p))
+}
+
+condition active_grant(request_time: timestamp, not_before: timestamp, not_after: timestamp) {
+    request_time >= not_before && request_time < not_after
+}
