@@ -1,15 +1,44 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  CI assertion suite.   Run:  fga model test --tests store.fga.yaml
+#
+#  Every test below is a REGRESSION test for a specific failure mode, not a
+#  happy-path demo. When adding a relation, add its allow case, its deny
+#  case, and its boundary case (see README "Rules for extending").
+#
+#  T-13 (tuple context precedence) must never be deleted: it pins the
+#  property the whole design rests on.
+# ═══════════════════════════════════════════════════════════════════════════
+
+name: container-admission
 model_file: ./model.fga
 tuple_file: ./tuples/prod.yaml
 
 tests:
-  - name: coarse gate needs no request-specific context
+
+  # ── coarse gate ─────────────────────────────────────────────────────────
+  - name: T-01 coarse gate evaluates with ambient context only
+    description: |
+      may_create_container must never touch a request-specific condition.
+      If this test starts failing with an evaluation error, someone put an
+      image/mount/sysctl condition on the `holds` path.
     check:
       - user: user:alice.chen
         object: host:hv-lon-01
         context: {request_time: "2026-08-05T10:00:00Z"}
-        assertions: {may_create_container: true}
+        assertions:
+          may_create_container: true
 
-  - name: permitted image on curated profile
+  - name: T-02 coarse gate is a necessary condition, not a sufficient one
+    description: Non-operator fails the coarse gate, so the fast reject is sound.
+    check:
+      - user: user:carol.dinh
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T10:00:00Z"}
+        assertions:
+          may_create_container: false
+
+  # ── image ───────────────────────────────────────────────────────────────
+  - name: T-03 permitted image on curated profile
     check:
       - user: user:alice.chen
         object: host:hv-lon-01
@@ -18,9 +47,14 @@ tests:
           image_repo: registry.corp.example/java/temurin-21
           image_tag: "21.0.3"
           image_digest: "sha256:9f2c4a1e8b7d6c5f0a3e2d1c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a2918070f6e"
-        assertions: {can_create_container: true}
+        assertions:
+          can_create_container: true
 
-  - name: unanchored-suffix regression — evil host must not match
+  - name: T-04 unanchored-suffix regression
+    description: |
+      matches() is a search, not a full match. An unanchored pattern would
+      let evil.example/x/registry.corp.example/... through. This is the
+      single most likely way a future pattern edit introduces a bypass.
     check:
       - user: user:alice.chen
         object: host:hv-lon-01
@@ -29,9 +63,13 @@ tests:
           image_repo: evil.example/x/registry.corp.example/java/temurin-21
           image_tag: "21.0.3"
           image_digest: "sha256:9f2c4a1e8b7d6c5f0a3e2d1c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a2918070f6e"
-        assertions: {can_create_container: false}
+        assertions:
+          can_create_container: false
 
-  - name: guardrail beats a matching grant
+  - name: T-05 guardrail beats a matching grant
+    description: |
+      registry.corp.example/payments/ledger matches the profile pattern, but
+      the :latest tag is globally denied. `but not` must win.
     check:
       - user: user:alice.chen
         object: host:hv-lon-01
@@ -40,9 +78,10 @@ tests:
           image_repo: registry.corp.example/payments/ledger
           image_tag: latest
           image_digest: "sha256:9f2c4a1e8b7d6c5f0a3e2d1c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a2918070f6e"
-        assertions: {can_create_container: false}
+        assertions:
+          can_create_container: false
 
-  - name: require_digest rejects tag-only reference
+  - name: T-06 require_digest rejects a tag-only reference
     check:
       - user: user:alice.chen
         object: host:hv-lon-01
@@ -51,41 +90,105 @@ tests:
           image_repo: registry.corp.example/base/ubi9
           image_tag: "9.4"
           image_digest: ""
-        assertions: {can_create_container: false}
+        assertions:
+          can_create_container: false
 
-  - name: rw grant subsumes ro, ro grant does not confer rw
+  - name: T-07 malformed digest does not satisfy "present"
+    description: The presence test is format-validated, not != "".
     check:
       - user: user:alice.chen
         object: host:hv-lon-01
-        context: {request_time: "2026-08-05T10:00:00Z", mount_source: /srv/payments/scratch/x}
-        assertions: {can_mount_ro: true, can_mount_rw: true}
-      - user: user:alice.chen
-        object: host:hv-lon-01
-        context: {request_time: "2026-08-05T10:00:00Z", mount_source: /srv/refdata/rates}
-        assertions: {can_mount_ro: true, can_mount_rw: false}
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          image_repo: registry.corp.example/base/ubi9
+          image_tag: "9.4"
+          image_digest: "sha256:deadbeef"
+        assertions:
+          can_create_container: false
 
-  - name: prefix boundary — sibling directory must not match
+  # ── mounts ──────────────────────────────────────────────────────────────
+  - name: T-08 rw grant subsumes ro; ro grant does not confer rw
     check:
       - user: user:alice.chen
         object: host:hv-lon-01
-        context: {request_time: "2026-08-05T10:00:00Z", mount_source: /srv/payments/scratch-of-someone-else}
-        assertions: {can_mount_rw: false}
-
-  - name: banned capability overrides the grant
-    check:
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          mount_source: /srv/payments/scratch/build-42
+        assertions:
+          can_mount_ro: true
+          can_mount_rw: true
       - user: user:alice.chen
-        object: capability:prod/SYS_ADMIN
-        context: {request_time: "2026-08-05T10:00:00Z"}
-        assertions: {can_add: false}
+        object: host:hv-lon-01
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          mount_source: /srv/refdata/rates.db
+        assertions:
+          can_mount_ro: true
+          can_mount_rw: false
 
-  - name: expired grant denies
+  - name: T-09 prefix boundary — sibling directory must not match
+    description: |
+      Without the mandatory trailing slash on the prefix,
+      /srv/payments/scratch-of-someone-else would match.
     check:
       - user: user:alice.chen
         object: host:hv-lon-01
-        context: {request_time: "2027-01-01T00:00:00Z"}
-        assertions: {may_create_container: false}
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          mount_source: /srv/payments/scratch-of-someone-else
+        assertions:
+          can_mount_ro: false
+          can_mount_rw: false
 
-  - name: tuple context wins over request context — grant cannot be self-widened
+  - name: T-10 guardrail blocks the podman socket regardless of grant
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          mount_source: /run/podman/podman.sock
+        assertions:
+          can_mount_ro: false
+          can_mount_rw: false
+
+  # ── sysctls ─────────────────────────────────────────────────────────────
+  - name: T-11 sysctl prefix allow and exact-value pin
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          sysctl_key: net.ipv4.tcp_keepalive_time
+          sysctl_value: "120"
+        assertions:
+          can_set_sysctl: true
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          sysctl_key: net.core.somaxconn
+          sysctl_value: "65535"          # value not pinned in allowed_exact
+        assertions:
+          can_set_sysctl: false
+
+  - name: T-12 guardrail blocks the CAP_NET_BIND_SERVICE side door
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          sysctl_key: net.ipv4.ip_unprivileged_port_start
+          sysctl_value: "0"
+        assertions:
+          can_set_sysctl: false
+
+  # ── the load-bearing invariant ──────────────────────────────────────────
+  - name: T-13 tuple context wins over request context
+    description: |
+      DO NOT DELETE. Pins the property the design rests on: a caller cannot
+      widen their own grant by supplying allowed_patterns in the request.
+      If a server upgrade changed this precedence, this test breaks the
+      build rather than the controls.
     check:
       - user: user:alice.chen
         object: host:hv-lon-01
@@ -95,4 +198,167 @@ tests:
           image_tag: "1"
           image_digest: "sha256:9f2c4a1e8b7d6c5f0a3e2d1c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a2918070f6e"
           allowed_patterns: ["^.*$"]
-        assertions: {can_create_container: false}
+          require_digest: false
+        assertions:
+          can_create_container: false
+
+  # ── time-boxing ─────────────────────────────────────────────────────────
+  - name: T-14 expired grant denies
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context: {request_time: "2027-01-01T00:00:00Z"}
+        assertions:
+          may_create_container: false
+
+  - name: T-15 escalation window opens and closes on its own
+    check:
+      - user: user:eve.tanaka
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T12:00:00Z"}
+        assertions:
+          can_use_host_pid_ns: true
+          can_use_privileged: true
+      - user: user:eve.tanaka
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T18:00:00Z"}   # after not_after
+        assertions:
+          can_use_host_pid_ns: false
+          can_use_privileged: false
+
+  # ── escalations ─────────────────────────────────────────────────────────
+  - name: T-16 escalations are independent, not a shared danger flag
+    description: |
+      market-data holds f_host_net and nothing else. Granting one escalation
+      must not leak any other.
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T10:00:00Z"}
+        assertions:
+          can_use_host_network: true
+          can_use_host_pid_ns: false
+          can_use_host_ipc_ns: false
+          can_use_host_user_ns: false
+          can_use_unconfined_seccomp: false
+          can_use_unconfined_apparmor: false
+          can_disable_selinux: false
+          can_use_privileged: false
+
+  - name: T-17 privileged requires its constituent grants
+    description: |
+      f_privileged alone is not enough — grants_seccomp_off and
+      grants_lsm_off are required so --privileged cannot be used to skip
+      those separate approvals. alice holds neither.
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T10:00:00Z"}
+        assertions:
+          can_use_privileged: false
+
+  # ── capabilities and devices ────────────────────────────────────────────
+  - name: T-18 capability grant flows through the profile
+    check:
+      - user: user:alice.chen
+        object: capability:prod/NET_BIND_SERVICE
+        context: {request_time: "2026-08-05T10:00:00Z"}
+        assertions:
+          can_add: true
+
+  - name: T-19 banned capability overrides every grant
+    check:
+      - user: user:alice.chen
+        object: capability:prod/SYS_ADMIN
+        context: {request_time: "2026-08-05T10:00:00Z"}
+        assertions:
+          can_add: false
+
+  - name: T-20 device rw is not implied by device ro
+    check:
+      - user: user:alice.chen
+        object: device:hv-lon-01/kvm
+        context: {request_time: "2026-08-05T10:00:00Z"}
+        assertions:
+          can_use_ro: true
+          can_use_rw: false
+      - user: user:alice.chen
+        object: device:hv-lon-01/nvidia0
+        context: {request_time: "2026-08-05T10:00:00Z"}
+        assertions:
+          can_use_ro: true
+          can_use_rw: true
+
+  # ── group nesting and inheritance ───────────────────────────────────────
+  - name: T-21 nested group membership inherits entitlement
+    check:
+      - user: user:grace.olsen
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T10:00:00Z"}
+        assertions:
+          may_create_container: true
+    tuples:
+      - user: user:grace.olsen
+        relation: member
+        object: group:payments-sre        # nested inside payments-devs
+
+  - name: T-22 host-only operator does not confer capability use
+    description: |
+      Documents the `operator from scope` convention. eve is a host-level
+      operator; capability.can_add checks environment-level operator, which
+      she also holds via group:fleet-ops. Were that group grant removed,
+      the host tuple alone would not suffice.
+    check:
+      - user: user:eve.tanaka
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T12:00:00Z"}
+        assertions:
+          may_create_container: true
+
+  # ── incident kill-switch ────────────────────────────────────────────────
+  - name: T-23 freeze kills every escalation but leaves routine work alone
+    check:
+      - user: user:eve.tanaka
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T12:00:00Z"}
+        assertions:
+          can_use_privileged: false
+          can_use_host_pid_ns: false
+          may_create_container: true      # deliberately unaffected
+    tuples:
+      - user: user:*
+        relation: frozen
+        object: environment:prod
+
+  # ── control plane ───────────────────────────────────────────────────────
+  - name: T-24 SoD — owner and approver are disjoint pools
+    description: |
+      Enforced by the policy-admin service, which Checks these before any
+      Write. OpenFGA's Write API has no per-tuple authz of its own.
+    check:
+      - user: user:frank.mbeki                # platform-eng
+        object: runtime_profile:payments-web
+        assertions:
+          owner: true
+          approver: false
+      - user: user:bob.novak                  # platform-sec
+        object: runtime_profile:payments-web
+        assertions:
+          owner: false
+          approver: true
+      - user: user:alice.chen                 # holder, neither
+        object: runtime_profile:payments-web
+        assertions:
+          owner: false
+          approver: false
+
+  - name: T-25 guardrail authorship is security-only
+    check:
+      - user: user:bob.novak
+        object: guardrail:baseline
+        assertions:
+          owner: true
+      - user: user:carol.dinh
+        object: guardrail:baseline
+        assertions:
+          owner: false
