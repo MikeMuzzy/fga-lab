@@ -190,3 +190,32 @@ func (p *PEP) Authorize(ctx context.Context, req Request) (Decision, error) {
 	}
 	return d, nil
 }
+
+// Combinations OpenFGA cannot express: a Check answers one question, and
+// "at most N of these together" is not one question. These are hard denies
+// regardless of the individual grants.
+func denyCombinations(r Request) error {
+	has := func(c string) bool { return contains(r.Caps, c) || r.Privileged }
+	rwMount := false
+	for _, m := range r.Mounts {
+		if m.RW {
+			rwMount = true
+		}
+	}
+	lsmOff := r.SELinuxDisabled || r.AppArmorUnconfined || r.Privileged
+	seccompOff := r.SeccompUnconfined || r.Privileged
+
+	switch {
+	case r.HostPID && has("SYS_PTRACE"):
+		return errors.New("host_pid_with_ptrace") // reads any host process's memory + env
+	case lsmOff && rwMount:
+		return errors.New("lsm_off_with_rw_mount") // labelling was constraining the mount
+	case r.HostUser && rwMount:
+		return errors.New("host_userns_with_rw_mount") // writes land as the real uid
+	case seccompOff && has("SYS_ADMIN"):
+		return errors.New("seccomp_off_with_sys_admin") // mount/bpf/keyctl reachable
+	case r.HostNet && len(r.Sysctls) > 0:
+		return errors.New("host_net_with_sysctl") // container does not own the netns
+	}
+	return nil
+}
