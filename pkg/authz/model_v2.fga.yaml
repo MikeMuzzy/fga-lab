@@ -1,0 +1,98 @@
+model_file: ./model.fga
+tuple_file: ./tuples/prod.yaml
+
+tests:
+  - name: coarse gate needs no request-specific context
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T10:00:00Z"}
+        assertions: {may_create_container: true}
+
+  - name: permitted image on curated profile
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          image_repo: registry.corp.example/java/temurin-21
+          image_tag: "21.0.3"
+          image_digest: "sha256:9f2c4a1e8b7d6c5f0a3e2d1c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a2918070f6e"
+        assertions: {can_create_container: true}
+
+  - name: unanchored-suffix regression — evil host must not match
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          image_repo: evil.example/x/registry.corp.example/java/temurin-21
+          image_tag: "21.0.3"
+          image_digest: "sha256:9f2c4a1e8b7d6c5f0a3e2d1c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a2918070f6e"
+        assertions: {can_create_container: false}
+
+  - name: guardrail beats a matching grant
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          image_repo: registry.corp.example/payments/ledger
+          image_tag: latest
+          image_digest: "sha256:9f2c4a1e8b7d6c5f0a3e2d1c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a2918070f6e"
+        assertions: {can_create_container: false}
+
+  - name: require_digest rejects tag-only reference
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          image_repo: registry.corp.example/base/ubi9
+          image_tag: "9.4"
+          image_digest: ""
+        assertions: {can_create_container: false}
+
+  - name: rw grant subsumes ro, ro grant does not confer rw
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T10:00:00Z", mount_source: /srv/payments/scratch/x}
+        assertions: {can_mount_ro: true, can_mount_rw: true}
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T10:00:00Z", mount_source: /srv/refdata/rates}
+        assertions: {can_mount_ro: true, can_mount_rw: false}
+
+  - name: prefix boundary — sibling directory must not match
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context: {request_time: "2026-08-05T10:00:00Z", mount_source: /srv/payments/scratch-of-someone-else}
+        assertions: {can_mount_rw: false}
+
+  - name: banned capability overrides the grant
+    check:
+      - user: user:alice.chen
+        object: capability:prod/SYS_ADMIN
+        context: {request_time: "2026-08-05T10:00:00Z"}
+        assertions: {can_add: false}
+
+  - name: expired grant denies
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context: {request_time: "2027-01-01T00:00:00Z"}
+        assertions: {may_create_container: false}
+
+  - name: tuple context wins over request context — grant cannot be self-widened
+    check:
+      - user: user:alice.chen
+        object: host:hv-lon-01
+        context:
+          request_time: "2026-08-05T10:00:00Z"
+          image_repo: evil.example/backdoor
+          image_tag: "1"
+          image_digest: "sha256:9f2c4a1e8b7d6c5f0a3e2d1c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a2918070f6e"
+          allowed_patterns: ["^.*$"]
+        assertions: {can_create_container: false}
