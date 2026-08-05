@@ -1,25 +1,191 @@
-# who may use podman at all (the image check is orthogonal to this)
-group:sre-prod#member          operator        environment:prod
-host:hv-lon-01                 environment     environment:prod
+# ═══ group.member ═══════════════════════════════════════════════════════
+- user: user:alice.chen        relation: member  object: group:payments-devs
+- user: group:payments-sre#member  relation: member  object: group:payments-devs
+- user: user:bob.novak         relation: member  object: group:platform-sec
+- user: user:carol.dinh        relation: member  object: group:storage-eng
+- user: user:dan.oyelaran      relation: member  object: group:payments-leads
+- user: user:eve.tanaka        relation: member  object: group:fleet-ops
 
-# the policy definition — ONE tuple, diffable, four-eyes reviewable
-user:*   pattern   image_policy:java-base-v7
-  image_allowed{
-    allowed_patterns: [
-      "^registry.corp.example/base/ubi9(-minimal)?$",
-      "^registry.corp.example/java/(temurin|corretto)-(17|21)$"
-    ],
-    require_digest: true
-  }
+# ═══ environment.parent / admin / operator / frozen ═════════════════════
+- user: environment:global     relation: parent    object: environment:prod
+- user: group:platform-sec#member  relation: admin  object: environment:prod
+- user: group:payments-devs#member  relation: operator  object: environment:prod
+  condition:
+    name: active_grant
+    context: {not_before: "2026-01-01T00:00:00Z", not_after: "2026-12-31T00:00:00Z"}
+# frozen: written ONLY during an incident; deleting it un-freezes.
+# - user: user:*  relation: frozen  object: environment:prod
 
-# entitlement, time-boxed
-group:payments-devs#member  subject  image_policy:java-base-v7
-  active_grant{not_before: "2026-08-01T00:00:00Z", not_after: "2026-11-01T00:00:00Z"}
+# ═══ environment.profile / mount_policy / guardrail ═════════════════════
+- user: runtime_profile:payments-web   relation: profile       object: environment:prod
+- user: runtime_profile:market-data    relation: profile       object: environment:prod
+- user: mount_policy:payments-data     relation: mount_policy  object: environment:prod
+- user: guardrail:baseline             relation: guardrail     object: environment:global
 
-# binding policy to scope
-image_policy:java-base-v7   image_policy   environment:prod
+# ═══ host.environment / operator / profile ══════════════════════════════
+- user: environment:prod   relation: environment  object: host:hv-lon-01
+# host-scoped exception (see convention note below)
+- user: user:eve.tanaka    relation: operator     object: host:hv-lon-01
+  condition:
+    name: active_grant
+    context: {not_before: "2026-08-05T00:00:00Z", not_after: "2026-08-06T00:00:00Z"}
+# host-scoped profile, not visible to the rest of prod
+- user: runtime_profile:lon-capture    relation: profile  object: host:hv-lon-01
 
-# global quarantine (CVE recall, floating tags)
-user:*  denies  deny_policy:quarantine
-  image_denied{denied_patterns: ["^.*:latest$", "^registry.corp.example/legacy/log4j-app:.*$"]}
-deny_policy:quarantine  deny_policy  environment:prod
+# ═══ runtime_profile.owner / approver / subject ═════════════════════════
+- user: group:platform-eng#member   relation: owner     object: runtime_profile:payments-web
+- user: group:platform-sec#member   relation: approver  object: runtime_profile:payments-web
+- user: group:payments-devs#member  relation: subject   object: runtime_profile:payments-web
+  condition:
+    name: active_grant
+    context: {not_before: "2026-08-01T00:00:00Z", not_after: "2026-11-01T00:00:00Z"}
+
+# ═══ runtime_profile.image_pattern ══════════════════════════════════════
+- user: user:*  relation: image_pattern  object: runtime_profile:payments-web
+  condition:
+    name: image_allowed
+    context:
+      allowed_patterns:
+        - "^registry.corp.example/base/ubi9(-minimal)?$"
+        - "^registry.corp.example/java/(temurin|corretto)-(17|21)$"
+        - "^registry.corp.example/payments/[a-z0-9-]+$"
+      allowed_digests: []
+      require_digest: true
+
+# golden-image tier: exact digests, no regex
+- user: user:*  relation: image_pattern  object: runtime_profile:market-data
+  condition:
+    name: image_allowed
+    context:
+      allowed_patterns: []
+      allowed_digests: ["sha256:9f2c4a1e8b7d6c5f0a3e2d1c9b8a7f6e5d4c3b2a1908f7e6d5c4b3a2918070f6e"]
+      require_digest: true
+
+# ═══ runtime_profile.sysctl_rule ════════════════════════════════════════
+- user: user:*  relation: sysctl_rule  object: runtime_profile:payments-web
+  condition:
+    name: sysctl_allowed
+    context:
+      allowed_prefixes: ["net.ipv4.tcp_"]
+      allowed_exact: ["net.core.somaxconn=4096", "kernel.shmmax=17179869184"]
+
+# ═══ runtime_profile.f_* (escalation flags) ═════════════════════════════
+# Every one is time-boxed and ticketed. Written only by the change pipeline.
+- user: user:*  relation: f_host_net  object: runtime_profile:market-data
+  condition:
+    name: escalation_window
+    context: {not_before: "2026-08-05T00:00:00Z", not_after: "2026-08-12T00:00:00Z", change_ticket: "CHG104412"}
+
+- user: user:*  relation: f_host_pid  object: runtime_profile:lon-capture
+  condition:
+    name: escalation_window
+    context: {not_before: "2026-08-05T09:00:00Z", not_after: "2026-08-05T17:00:00Z", change_ticket: "INC880231"}
+
+- user: user:*  relation: f_host_ipc  object: runtime_profile:lon-capture
+  condition:
+    name: escalation_window
+    context: {not_before: "2026-08-05T09:00:00Z", not_after: "2026-08-05T17:00:00Z", change_ticket: "INC880231"}
+
+- user: user:*  relation: f_host_user  object: runtime_profile:lon-capture
+  condition:
+    name: escalation_window
+    context: {not_before: "2026-08-05T09:00:00Z", not_after: "2026-08-05T17:00:00Z", change_ticket: "INC880231"}
+
+- user: user:*  relation: f_seccomp_off  object: runtime_profile:lon-capture
+  condition:
+    name: escalation_window
+    context: {not_before: "2026-08-05T09:00:00Z", not_after: "2026-08-05T17:00:00Z", change_ticket: "INC880231"}
+
+- user: user:*  relation: f_selinux_off  object: runtime_profile:lon-capture
+  condition:
+    name: escalation_window
+    context: {not_before: "2026-08-05T09:00:00Z", not_after: "2026-08-05T17:00:00Z", change_ticket: "INC880231"}
+
+- user: user:*  relation: f_apparmor_off  object: runtime_profile:lon-capture
+  condition:
+    name: escalation_window
+    context: {not_before: "2026-08-05T09:00:00Z", not_after: "2026-08-05T17:00:00Z", change_ticket: "INC880231"}
+
+# grants_privileged also needs seccomp_off + lsm_off, both present above
+- user: user:*  relation: f_privileged  object: runtime_profile:lon-capture
+  condition:
+    name: escalation_window
+    context: {not_before: "2026-08-05T09:00:00Z", not_after: "2026-08-05T17:00:00Z", change_ticket: "INC880231"}
+
+- user: group:fleet-ops#member  relation: subject  object: runtime_profile:lon-capture
+  condition:
+    name: active_grant
+    context: {not_before: "2026-08-05T09:00:00Z", not_after: "2026-08-05T17:00:00Z"}
+- user: user:*  relation: image_pattern  object: runtime_profile:lon-capture
+  condition:
+    name: image_allowed
+    context:
+      allowed_patterns: ["^registry.corp.example/ops/diag-toolbox$"]
+      allowed_digests: []
+      require_digest: true
+- user: group:fleet-ops#member    relation: owner     object: runtime_profile:lon-capture
+- user: group:platform-sec#member relation: approver  object: runtime_profile:lon-capture
+
+# ═══ capability.scope / via / banned ════════════════════════════════════
+- user: environment:prod              relation: scope  object: capability:prod/NET_BIND_SERVICE
+- user: runtime_profile:payments-web  relation: via    object: capability:prod/NET_BIND_SERVICE
+- user: environment:prod              relation: scope  object: capability:prod/SYS_NICE
+- user: runtime_profile:market-data   relation: via    object: capability:prod/SYS_NICE
+# hard ban — overrides every grant, security-owned
+- user: user:*  relation: banned  object: capability:prod/SYS_ADMIN
+- user: user:*  relation: banned  object: capability:prod/SYS_MODULE
+- user: user:*  relation: banned  object: capability:prod/BPF
+
+# ═══ device.host / via / mode_rw ════════════════════════════════════════
+- user: host:hv-lon-01               relation: host     object: device:hv-lon-01/kvm
+- user: runtime_profile:market-data  relation: via      object: device:hv-lon-01/kvm
+- user: host:hv-lon-01               relation: host     object: device:hv-lon-01/nvidia0
+- user: runtime_profile:market-data  relation: via      object: device:hv-lon-01/nvidia0
+- user: runtime_profile:market-data  relation: mode_rw  object: device:hv-lon-01/nvidia0
+
+# ═══ mount_policy.owner / subject / ro_rule / rw_rule ═══════════════════
+- user: group:storage-eng#member    relation: owner    object: mount_policy:payments-data
+- user: group:payments-devs#member  relation: subject  object: mount_policy:payments-data
+  condition:
+    name: active_grant
+    context: {not_before: "2026-08-01T00:00:00Z", not_after: "2026-11-01T00:00:00Z"}
+- user: user:*  relation: ro_rule  object: mount_policy:payments-data
+  condition:
+    name: path_allowed
+    context: {prefixes: ["/srv/refdata/", "/etc/corp-ca/"], allow_subpaths: true}
+- user: user:*  relation: rw_rule  object: mount_policy:payments-data
+  condition:
+    name: path_allowed
+    context: {prefixes: ["/srv/payments/scratch/"], allow_subpaths: true}
+
+# ═══ guardrail.owner / forbids_* ════════════════════════════════════════
+- user: group:platform-sec#member  relation: owner  object: guardrail:baseline
+
+- user: user:*  relation: forbids_image  object: guardrail:baseline
+  condition:
+    name: image_denied
+    context:
+      denied_patterns: ["^.*:latest$", "^registry.corp.example/legacy/.*$"]
+      denied_digests: ["sha256:0000dead0000beef1111cafe2222f00d3333ba5e4444abcd5555ef01234567890"]
+
+- user: user:*  relation: forbids_mount  object: guardrail:baseline
+  condition:
+    name: path_matches
+    context:
+      patterns:
+        - "^/$"
+        - "^/(etc|proc|sys|dev|boot|root)(/.*)?$"
+        - "^/var/lib/containers(/.*)?$"
+        - "^/run/podman/podman\\.sock$"
+        - "^/run/user/[0-9]+/podman/podman\\.sock$"
+        - "^/home/[^/]+/\\.(ssh|config/containers)(/.*)?$"
+
+- user: user:*  relation: forbids_sysctl  object: guardrail:baseline
+  condition:
+    name: sysctl_matches
+    context:
+      patterns:
+        - "^kernel\\.core_pattern$"
+        - "^kernel\\.modprobe$"
+        - "^fs\\.suid_dumpable$"
+        - "^net\\.ipv4\\.ip_unprivileged_port_start$"   # CAP_NET_BIND_SERVICE by another name
