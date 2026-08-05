@@ -1,56 +1,188 @@
 model
   schema 1.2
 
+# ══ principals ═════════════════════════════════════════════════════════
 type user
 
 type group
   relations
     define member: [user, group#member]
 
-type environment          # prod / uat / dev — the blast-radius boundary
+# ══ scope ══════════════════════════════════════════════════════════════
+type environment
   relations
     define parent: [environment]
-    define operator: [user, group#member] or operator from parent
-    define image_policy: [image_policy] or image_policy from parent
-    define deny_policy: [deny_policy] or deny_policy from parent
+
+    # control plane
+    define admin: [group#member]
+
+    # data plane
+    define operator: [user, group#member, user with active_grant, group#member with active_grant] or operator from parent
+    define profile: [runtime_profile] or profile from parent
+    define mount_policy: [mount_policy] or mount_policy from parent
+    define guardrail: [guardrail] or guardrail from parent
+
+    # incident kill-switch: one tuple write freezes every escalation in scope
+    define frozen: [user:*, user, group#member] or frozen from parent
 
 type host
   relations
     define environment: [environment]
-    define operator: [user, group#member] or operator from environment
-    define image_policy: [image_policy] or image_policy from environment
-    define deny_policy: [deny_policy] or deny_policy from environment
-    define permitted_image: permits from image_policy
-    define denied_image: denies from deny_policy
-    define can_create_container: (operator and permitted_image) but not denied_image
 
-type image_policy         # a named, versioned, reviewable bundle of patterns
+    define operator: [user, group#member, user with active_grant, group#member with active_grant] or operator from environment
+    define profile: [runtime_profile] or profile from environment
+    define mount_policy: [mount_policy] or mount_policy from environment
+    define guardrail: [guardrail] or guardrail from environment
+
+    define escalation_eligible: operator but not frozen from environment
+
+    # ── coarse gate: ambient context only (request_time). Safe for ListObjects.
+    define may_create_container: operator and holds from profile
+
+    # ── enforcing checks: request-specific context required
+    define can_create_container: (operator and grants_image from profile) but not forbids_image from guardrail
+    define can_mount_ro: (operator and allows_ro from mount_policy) but not forbids_mount from guardrail
+    define can_mount_rw: (operator and allows_rw from mount_policy) but not forbids_mount from guardrail
+    define can_set_sysctl: (operator and grants_sysctl from profile) but not forbids_sysctl from guardrail
+
+    # ── escalations: each independently approved, each independently revocable
+    define can_use_host_pid_ns: escalation_eligible and grants_host_pid from profile
+    define can_use_host_ipc_ns: escalation_eligible and grants_host_ipc from profile
+    define can_use_host_user_ns: escalation_eligible and grants_host_user from profile
+    define can_use_host_network: escalation_eligible and grants_host_net from profile
+    define can_use_unconfined_seccomp: escalation_eligible and grants_seccomp_off from profile
+    define can_use_unconfined_apparmor: escalation_eligible and grants_apparmor_off from profile
+    define can_disable_selinux: escalation_eligible and grants_selinux_off from profile
+    define can_use_privileged: escalation_eligible and grants_privileged from profile
+
+# ══ the unit of entitlement ════════════════════════════════════════════
+type runtime_profile
+  relations
+    # control plane — see SoD note below
+    define owner: [group#member]        # may edit patterns and rules
+    define approver: [group#member]     # may set escalation flags
+
+    # data plane
+    define subject: [user, group#member, user with active_grant, group#member with active_grant]
+
+    define image_pattern: [user:* with image_allowed]
+    define sysctl_rule: [user:* with sysctl_allowed]
+
+    define f_host_pid: [user:* with escalation_window]
+    define f_host_ipc: [user:* with escalation_window]
+    define f_host_user: [user:* with escalation_window]
+    define f_host_net: [user:* with escalation_window]
+    define f_seccomp_off: [user:* with escalation_window]
+    define f_apparmor_off: [user:* with escalation_window]
+    define f_selinux_off: [user:* with escalation_window]
+    define f_privileged: [user:* with escalation_window]
+
+    define holds: subject
+    define grants_image: subject and image_pattern
+    define grants_sysctl: subject and sysctl_rule
+
+    define grants_host_pid: subject and f_host_pid
+    define grants_host_ipc: subject and f_host_ipc
+    define grants_host_user: subject and f_host_user
+    define grants_host_net: subject and f_host_net
+    define grants_seccomp_off: subject and f_seccomp_off
+    define grants_apparmor_off: subject and f_apparmor_off
+    define grants_selinux_off: subject and f_selinux_off
+
+    # a host runs one LSM; require whichever is in play, not both
+    define grants_lsm_off: grants_apparmor_off or grants_selinux_off
+
+    # privileged subsumes seccomp + LSM. Requiring them prevents using
+    # --privileged to skip their separate approvals.
+    define grants_privileged: ((subject and f_privileged) and grants_seccomp_off) and grants_lsm_off
+
+# ══ enumerable resources ═══════════════════════════════════════════════
+type capability                      # id: "<env>/<CAP>"  e.g. capability:prod/NET_BIND_SERVICE
+  relations
+    define scope: [environment]
+    define via: [runtime_profile]
+    define banned: [user:*, user, group#member]
+    define can_add: ((subject from via) and operator from scope) but not banned
+
+type device                          # id: "<host>/<name>"  e.g. device:hv-lon-01/kvm
+  relations
+    define host: [host]
+    define via: [runtime_profile]
+    define mode_rw: [runtime_profile]
+    define can_use_ro: (subject from via) and operator from host
+    define can_use_rw: (subject from mode_rw) and operator from host
+
+# ══ unbounded value spaces ═════════════════════════════════════════════
+type mount_policy
   relations
     define owner: [group#member]
     define subject: [user, group#member, user with active_grant, group#member with active_grant]
-    define pattern: [user:* with image_allowed]
-    define permits: subject and pattern
+    define ro_rule: [user:* with path_allowed]
+    define rw_rule: [user:* with path_allowed]
+    define allows_ro: subject and (ro_rule or rw_rule)   # rw subsumes ro
+    define allows_rw: subject and rw_rule
 
-type deny_policy
+type guardrail                       # security-owned, environment-attached, always wins
   relations
     define owner: [group#member]
-    define denies: [user:* with image_denied, user with image_denied, group#member with image_denied]
+    define forbids_image: [user:* with image_denied]
+    define forbids_mount: [user:* with path_matches]
+    define forbids_sysctl: [user:* with sysctl_matches]
 
-condition image_allowed(
-    image_repo: string,        # canonical "registry/namespace/name", from context
-    image_tag: string,
-    image_digest: string,
-    allowed_patterns: list<string>,   # from the tuple
-    require_digest: bool
-) {
-    (require_digest == false || image_digest != "") &&
-    allowed_patterns.exists(p, image_repo.matches(p))
-}
-
-condition image_denied(image_repo: string, image_tag: string, denied_patterns: list<string>) {
-    denied_patterns.exists(p, (image_repo + ":" + image_tag).matches(p))
-}
-
+# ── ambient: request_time is supplied by the server, never by the caller ──
 condition active_grant(request_time: timestamp, not_before: timestamp, not_after: timestamp) {
     request_time >= not_before && request_time < not_after
+}
+
+condition escalation_window(
+    request_time: timestamp, not_before: timestamp,
+    not_after: timestamp, change_ticket: string
+) {
+    request_time >= not_before && request_time < not_after &&
+    change_ticket.matches("^(CHG|INC)[0-9]{6,}$")
+}
+
+# ── image: repo is canonicalised by the PEP before it reaches CEL ──
+condition image_allowed(
+    image_repo: string, image_digest: string,
+    allowed_patterns: list<string>, allowed_digests: list<string>,
+    require_digest: bool
+) {
+    (!require_digest || image_digest.matches("^sha256:[a-f0-9]{64}$")) &&
+    (allowed_digests.size() > 0
+        ? image_digest in allowed_digests
+        : allowed_patterns.exists(p, image_repo.matches(p)))
+}
+
+condition image_denied(
+    image_repo: string, image_tag: string, image_digest: string,
+    denied_patterns: list<string>, denied_digests: list<string>
+) {
+    denied_patterns.exists(p, (image_repo + ":" + image_tag).matches(p)) ||
+    (image_digest != "" && image_digest in denied_digests)
+}
+
+# ── mounts: prefixes MUST end in "/" — the component boundary ──
+condition path_allowed(mount_source: string, prefixes: list<string>, allow_subpaths: bool) {
+    mount_source.startsWith("/") &&
+    !mount_source.contains("/../") && !mount_source.endsWith("/..") &&
+    prefixes.exists(p, allow_subpaths ? mount_source.startsWith(p) : mount_source + "/" == p)
+}
+
+condition path_matches(mount_source: string, patterns: list<string>) {
+    patterns.exists(p, mount_source.matches(p))
+}
+
+# ── sysctls ──
+condition sysctl_allowed(
+    sysctl_key: string, sysctl_value: string,
+    allowed_prefixes: list<string>, allowed_exact: list<string>
+) {
+    sysctl_key.matches("^[a-z][a-z0-9_.]{0,127}$") &&
+    (allowed_prefixes.exists(p, sysctl_key.startsWith(p)) ||
+     allowed_exact.exists(e, e == sysctl_key + "=" + sysctl_value))
+}
+
+condition sysctl_matches(sysctl_key: string, patterns: list<string>) {
+    patterns.exists(p, sysctl_key.matches(p))
 }
