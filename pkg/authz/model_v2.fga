@@ -1,19 +1,39 @@
 model
   schema 1.2
 
-# ══ principals ═════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+#  Container admission authorization model
+#
+#  Enforced by the container broker (the PEP) at container-create time.
+#  See README.md for design rationale and the rules for extending this file.
+#
+#  INVARIANTS — do not break without a documented ADR:
+#   1. Every relation name is prefixed by its plane: can_ / may_ (data plane,
+#      queried by the broker) vs owner / approver / admin (control plane,
+#      queried by the policy-admin service only).
+#   2. Every condition parameter carries a domain prefix (image_*, mount_*,
+#      sysctl_*) because request context is a FLAT namespace shared by all
+#      conditions on the evaluation path.
+#   3. Every regex pattern is ^...$ anchored. matches() is a search, not a
+#      full match.
+#   4. Every path prefix ends in "/". That slash is the component boundary.
+#   5. Escalation flags (f_*) are only ever typed [user:* with
+#      escalation_window] so they cannot be granted without an expiry.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── principals ────────────────────────────────────────────────────────────
 type user
 
 type group
   relations
     define member: [user, group#member]
 
-# ══ scope ══════════════════════════════════════════════════════════════
+# ── scope ─────────────────────────────────────────────────────────────────
 type environment
   relations
     define parent: [environment]
 
-    # control plane
+    # control plane: may write guardrails and capability bans in this scope
     define admin: [group#member]
 
     # data plane
@@ -22,7 +42,9 @@ type environment
     define mount_policy: [mount_policy] or mount_policy from parent
     define guardrail: [guardrail] or guardrail from parent
 
-    # incident kill-switch: one tuple write freezes every escalation in scope
+    # incident kill-switch: one tuple write freezes every escalation in scope,
+    # deleting it un-freezes. Deliberately does NOT freeze can_create_container
+    # — an incident should not stop routine work.
     define frozen: [user:*, user, group#member] or frozen from parent
 
 type host
@@ -36,16 +58,22 @@ type host
 
     define escalation_eligible: operator but not frozen from environment
 
-    # ── coarse gate: ambient context only (request_time). Safe for ListObjects.
+    # ── coarse gate ──────────────────────────────────────────────────────
+    # Ambient context only (request_time). Safe for ListObjects. A pass here
+    # is a NECESSARY condition for can_create_container, never a sufficient
+    # one. Never cache this into the enforcing path.
     define may_create_container: operator and holds from profile
 
-    # ── enforcing checks: request-specific context required
+    # ── enforcing checks (request-specific context required) ─────────────
     define can_create_container: (operator and grants_image from profile) but not forbids_image from guardrail
     define can_mount_ro: (operator and allows_ro from mount_policy) but not forbids_mount from guardrail
     define can_mount_rw: (operator and allows_rw from mount_policy) but not forbids_mount from guardrail
     define can_set_sysctl: (operator and grants_sysctl from profile) but not forbids_sysctl from guardrail
 
-    # ── escalations: each independently approved, each independently revocable
+    # ── escalations ──────────────────────────────────────────────────────
+    # One relation each: independently approved, independently revocable,
+    # independently visible in an access review. Never collapse into a
+    # shared "danger" flag.
     define can_use_host_pid_ns: escalation_eligible and grants_host_pid from profile
     define can_use_host_ipc_ns: escalation_eligible and grants_host_ipc from profile
     define can_use_host_user_ns: escalation_eligible and grants_host_user from profile
@@ -55,12 +83,17 @@ type host
     define can_disable_selinux: escalation_eligible and grants_selinux_off from profile
     define can_use_privileged: escalation_eligible and grants_privileged from profile
 
-# ══ the unit of entitlement ════════════════════════════════════════════
+# ── the unit of entitlement ───────────────────────────────────────────────
+# A runtime_profile binds an image constraint to the capabilities, sysctls
+# and escalations that are only tolerable BECAUSE of that image constraint.
+# CAP_NET_BIND_SERVICE on a curated, digest-pinned image is routine; the same
+# capability on an arbitrary image is a primitive. Never attach capabilities
+# or escalations directly to environment or host.
 type runtime_profile
   relations
-    # control plane — see SoD note below
-    define owner: [group#member]        # may edit patterns and rules
-    define approver: [group#member]     # may set escalation flags
+    # control plane
+    define owner: [group#member]      # may edit image_pattern / sysctl_rule
+    define approver: [group#member]   # may write f_* escalation flags
 
     # data plane
     define subject: [user, group#member, user with active_grant, group#member with active_grant]
@@ -77,7 +110,11 @@ type runtime_profile
     define f_selinux_off: [user:* with escalation_window]
     define f_privileged: [user:* with escalation_window]
 
+    # `holds` is the ambient-only projection of `subject`, used by the
+    # coarse gate. Keeping it a separate name means the coarse and enforcing
+    # paths cannot be confused at a call site.
     define holds: subject
+
     define grants_image: subject and image_pattern
     define grants_sysctl: subject and sysctl_rule
 
@@ -89,22 +126,30 @@ type runtime_profile
     define grants_apparmor_off: subject and f_apparmor_off
     define grants_selinux_off: subject and f_selinux_off
 
-    # a host runs one LSM; require whichever is in play, not both
+    # A host runs one LSM, not both. AND-ing them would make privileged
+    # ungrantable on either distro.
     define grants_lsm_off: grants_apparmor_off or grants_selinux_off
 
-    # privileged subsumes seccomp + LSM. Requiring them prevents using
-    # --privileged to skip their separate approvals.
+    # --privileged subsumes seccomp and LSM confinement (it does NOT change
+    # namespaces — the broker must check those separately). Requiring the
+    # constituent grants prevents using --privileged to skip their approvals.
     define grants_privileged: ((subject and f_privileged) and grants_seccomp_off) and grants_lsm_off
 
-# ══ enumerable resources ═══════════════════════════════════════════════
-type capability                      # id: "<env>/<CAP>"  e.g. capability:prod/NET_BIND_SERVICE
+# ── enumerable resources ──────────────────────────────────────────────────
+# Finite value spaces get real objects, not condition lists: they support
+# ListObjects for UI and recert, need no CEL review, and re-verify host
+# access on the same edge.
+
+type capability                      # id: "<env>/<CAP>" e.g. capability:prod/NET_BIND_SERVICE
   relations
     define scope: [environment]
     define via: [runtime_profile]
     define banned: [user:*, user, group#member]
+    # `operator from scope` re-verifies environment access inside this query
+    # rather than trusting a prior client-side check.
     define can_add: ((subject from via) and operator from scope) but not banned
 
-type device                          # id: "<host>/<name>"  e.g. device:hv-lon-01/kvm
+type device                          # id: "<host>/<name>" e.g. device:hv-lon-01/kvm
   relations
     define host: [host]
     define via: [runtime_profile]
@@ -112,28 +157,47 @@ type device                          # id: "<host>/<name>"  e.g. device:hv-lon-0
     define can_use_ro: (subject from via) and operator from host
     define can_use_rw: (subject from mode_rw) and operator from host
 
-# ══ unbounded value spaces ═════════════════════════════════════════════
+# ── unbounded value spaces ────────────────────────────────────────────────
 type mount_policy
   relations
-    define owner: [group#member]
+    define owner: [group#member]     # storage/platform team
     define subject: [user, group#member, user with active_grant, group#member with active_grant]
     define ro_rule: [user:* with path_allowed]
     define rw_rule: [user:* with path_allowed]
     define allows_ro: subject and (ro_rule or rw_rule)   # rw subsumes ro
     define allows_rw: subject and rw_rule
 
-type guardrail                       # security-owned, environment-attached, always wins
+# Security-owned, environment-attached, always wins via `but not`.
+# Merged from three former denylist types: identical shape, one owner,
+# one attach point.
+type guardrail
   relations
     define owner: [group#member]
     define forbids_image: [user:* with image_denied]
     define forbids_mount: [user:* with path_matches]
     define forbids_sysctl: [user:* with sysctl_matches]
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONDITIONS
+#
+#  Request context is a flat, request-scoped bag. It is NOT bound to the
+#  relation being checked: unknown keys are inert at Check time (but rejected
+#  at Write time), and a MISSING key required by a condition on the
+#  evaluation path is an evaluation ERROR, not a denial. The PEP fails closed
+#  on error.
+#
+#  Tuple context takes precedence over request context on key collision.
+#  That precedence is what stops a caller widening their own grant by
+#  stuffing allowed_patterns into the request. It is pinned by a CI test.
+# ═══════════════════════════════════════════════════════════════════════════
+
 # ── ambient: request_time is supplied by the server, never by the caller ──
 condition active_grant(request_time: timestamp, not_before: timestamp, not_after: timestamp) {
     request_time >= not_before && request_time < not_after
 }
 
+# change_ticket is shape-validated only. CEL cannot confirm the ticket is
+# open — that is the change pipeline's job before it writes the tuple.
 condition escalation_window(
     request_time: timestamp, not_before: timestamp,
     not_after: timestamp, change_ticket: string
@@ -142,7 +206,9 @@ condition escalation_window(
     change_ticket.matches("^(CHG|INC)[0-9]{6,}$")
 }
 
-# ── image: repo is canonicalised by the PEP before it reaches CEL ──
+# image_repo is canonicalised and lowercased by the PEP before it reaches CEL
+# (docker.io/library/nginx, not nginx). allowed_digests non-empty selects the
+# golden-image tier: exact digests, no regex, immutable until a new tuple.
 condition image_allowed(
     image_repo: string, image_digest: string,
     allowed_patterns: list<string>, allowed_digests: list<string>,
@@ -154,6 +220,8 @@ condition image_allowed(
         : allowed_patterns.exists(p, image_repo.matches(p)))
 }
 
+# Tags move, digests do not. Digest denial is the CVE-recall primitive:
+# exact, and not evadable by rebuild-and-retag.
 condition image_denied(
     image_repo: string, image_tag: string, image_digest: string,
     denied_patterns: list<string>, denied_digests: list<string>
@@ -162,7 +230,8 @@ condition image_denied(
     (image_digest != "" && image_digest in denied_digests)
 }
 
-# ── mounts: prefixes MUST end in "/" — the component boundary ──
+# mount_source is realpath-resolved by the PEP. Every prefix MUST end in "/"
+# or "/srv/data" matches "/srv/data-of-someone-else".
 condition path_allowed(mount_source: string, prefixes: list<string>, allow_subpaths: bool) {
     mount_source.startsWith("/") &&
     !mount_source.contains("/../") && !mount_source.endsWith("/..") &&
@@ -173,7 +242,6 @@ condition path_matches(mount_source: string, patterns: list<string>) {
     patterns.exists(p, mount_source.matches(p))
 }
 
-# ── sysctls ──
 condition sysctl_allowed(
     sysctl_key: string, sysctl_value: string,
     allowed_prefixes: list<string>, allowed_exact: list<string>
